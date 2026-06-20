@@ -104,6 +104,12 @@ class PromptManager:
         """Get path to bundled prompt templates."""
         return Path(__file__).parent / "templates"
 
+    def has_template(self, prompt_id: str) -> bool:
+        """Return True if a template file exists for ``prompt_id``."""
+        if self.enable_caching and prompt_id in self._cache:
+            return True
+        return self._resolve_template_path(prompt_id).exists()
+
     def load_template(self, prompt_id: str) -> PromptTemplate:
         """
         Load a prompt template by ID.

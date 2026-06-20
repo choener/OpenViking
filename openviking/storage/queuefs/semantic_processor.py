@@ -29,7 +29,7 @@ from openviking.parse.parsers.media.utils import (
     generate_video_summary,
     get_media_type,
 )
-from openviking.prompts import render_prompt
+from openviking.prompts import get_manager, render_prompt
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
@@ -55,6 +55,29 @@ from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+_RESOURCES_MARKER = "/resources/"
+
+
+def _ancestor_prompt_id(dir_uri: str, suffix: str) -> Optional[str]:
+    """Return the nearest matching ``resource_dir.<folder>_<suffix>`` template id.
+
+    Walks path segments under the first ``/resources/`` marker, leaf-most first,
+    and returns the first prompt id whose template exists. Returns ``None`` when
+    no override is configured.
+    """
+    i = dir_uri.find(_RESOURCES_MARKER)
+    if i < 0:
+        return None
+    tail = dir_uri[i + len(_RESOURCES_MARKER) :]
+    segments = [s for s in tail.split("/") if s]
+    mgr = get_manager()
+    for name in reversed(segments):
+        pid = f"resource_dir.{name}_{suffix}"
+        if mgr.has_template(pid):
+            return pid
+    return None
 
 
 @dataclass
@@ -1060,6 +1083,23 @@ class SemanticProcessor(DequeueHandlerBase):
 
         output_language = resolve_output_language(content)
 
+        # Nearest-folder override beats the extension-based dispatch below.
+        parent_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
+        folder_prompt_id = _ancestor_prompt_id(parent_dir, "summary")
+        if folder_prompt_id:
+            prompt = render_prompt(
+                folder_prompt_id,
+                {
+                    "file_name": file_name,
+                    "content": content,
+                    "output_language": output_language,
+                },
+            )
+            async with llm_sem:
+                with bind_telemetry_stage("resource_summarize"):
+                    summary = await vlm.get_completion_async(prompt)
+            return {"name": file_name, "summary": summary.strip()}
+
         # Detect file type and select appropriate prompt
         file_type = self._detect_file_type(file_name)
 
@@ -1288,6 +1328,8 @@ class SemanticProcessor(DequeueHandlerBase):
             language_source_parts.append(dir_uri.split("/")[-1])
         output_language = resolve_output_language("\n".join(language_source_parts), config=config)
 
+        prompt_id = _ancestor_prompt_id(dir_uri, "overview") or "semantic.overview_generation"
+
         # Budget guard: check if prompt would be oversized
         estimated_size = len(file_summaries_str) + len(children_abstracts_str)
         over_budget = estimated_size > semantic.max_overview_prompt_chars
@@ -1307,6 +1349,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 file_index_map,
                 llm_sem=llm_sem,
                 output_language=output_language,
+                prompt_id=prompt_id,
             )
         elif over_budget:
             # Few files but long summaries → truncate summaries to fit budget
@@ -1329,6 +1372,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 children_abstracts_str,
                 file_index_map,
                 output_language=output_language,
+                prompt_id=prompt_id,
             )
         else:
             overview = await self._single_generate_overview(
@@ -1337,6 +1381,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 children_abstracts_str,
                 file_index_map,
                 output_language=output_language,
+                prompt_id=prompt_id,
             )
 
         return overview
@@ -1348,6 +1393,7 @@ class SemanticProcessor(DequeueHandlerBase):
         children_abstracts_str: str,
         file_index_map: Dict[int, str],
         output_language: str = "en",
+        prompt_id: str = "semantic.overview_generation",
     ) -> str:
         """Generate overview from a single prompt (small directories)."""
         import re
@@ -1356,7 +1402,7 @@ class SemanticProcessor(DequeueHandlerBase):
 
         try:
             prompt = render_prompt(
-                "semantic.overview_generation",
+                prompt_id,
                 {
                     "dir_name": dir_uri.split("/")[-1],
                     "file_summaries": file_summaries_str,
@@ -1392,6 +1438,7 @@ class SemanticProcessor(DequeueHandlerBase):
         file_index_map: Dict[int, str],
         llm_sem: Optional[asyncio.Semaphore] = None,
         output_language: str = "en",
+        prompt_id: str = "semantic.overview_generation",
     ) -> str:
         """Generate overview by batching file summaries and merging.
 
@@ -1440,7 +1487,7 @@ class SemanticProcessor(DequeueHandlerBase):
             children_str = children_abstracts_str if batch_idx == 0 else "None"
 
             prompt = render_prompt(
-                "semantic.overview_generation",
+                prompt_id,
                 {
                     "dir_name": dir_name,
                     "file_summaries": batch_str,
@@ -1484,7 +1531,7 @@ class SemanticProcessor(DequeueHandlerBase):
         combined = "\n\n---\n\n".join(partial_overviews)
         try:
             prompt = render_prompt(
-                "semantic.overview_generation",
+                prompt_id,
                 {
                     "dir_name": dir_name,
                     "file_summaries": combined,
