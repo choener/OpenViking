@@ -60,12 +60,14 @@ logger = get_logger(__name__)
 _RESOURCES_MARKER = "/resources/"
 
 
-def _ancestor_prompt_id(dir_uri: str, suffix: str) -> Optional[str]:
+def _ancestor_prompt_id(dir_uri: str, suffix: str) -> Optional[Tuple[str, bool]]:
     """Return the nearest matching ``resource_dir.<folder>_<suffix>`` template id.
 
-    Walks path segments under the first ``/resources/`` marker, leaf-most first,
-    and returns the first prompt id whose template exists. Returns ``None`` when
-    no override is configured.
+    Walks path segments under the first ``/resources/`` marker, leaf-most first.
+    At each level the ``_const`` variant is checked before the LLM-bound
+    variant; a ``_const`` template's rendered text is returned verbatim by the
+    caller (no LLM call). Returns ``(prompt_id, is_constant)`` for the first
+    hit, or ``None`` when no override is configured.
     """
     i = dir_uri.find(_RESOURCES_MARKER)
     if i < 0:
@@ -74,9 +76,12 @@ def _ancestor_prompt_id(dir_uri: str, suffix: str) -> Optional[str]:
     segments = [s for s in tail.split("/") if s]
     mgr = get_manager()
     for name in reversed(segments):
+        const_pid = f"resource_dir.{name}_{suffix}_const"
+        if mgr.has_template(const_pid):
+            return (const_pid, True)
         pid = f"resource_dir.{name}_{suffix}"
         if mgr.has_template(pid):
-            return pid
+            return (pid, False)
     return None
 
 
@@ -1085,8 +1090,9 @@ class SemanticProcessor(DequeueHandlerBase):
 
         # Nearest-folder override beats the extension-based dispatch below.
         parent_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
-        folder_prompt_id = _ancestor_prompt_id(parent_dir, "summary")
-        if folder_prompt_id:
+        folder_override = _ancestor_prompt_id(parent_dir, "summary")
+        if folder_override:
+            folder_prompt_id, is_const = folder_override
             prompt = render_prompt(
                 folder_prompt_id,
                 {
@@ -1095,6 +1101,8 @@ class SemanticProcessor(DequeueHandlerBase):
                     "output_language": output_language,
                 },
             )
+            if is_const:
+                return {"name": file_name, "summary": prompt.strip()}
             async with llm_sem:
                 with bind_telemetry_stage("resource_summarize"):
                     summary = await vlm.get_completion_async(prompt)
@@ -1328,7 +1336,19 @@ class SemanticProcessor(DequeueHandlerBase):
             language_source_parts.append(dir_uri.split("/")[-1])
         output_language = resolve_output_language("\n".join(language_source_parts), config=config)
 
-        prompt_id = _ancestor_prompt_id(dir_uri, "overview") or "semantic.overview_generation"
+        overview_override = _ancestor_prompt_id(dir_uri, "overview")
+        if overview_override and overview_override[1]:
+            const_prompt_id = overview_override[0]
+            return render_prompt(
+                const_prompt_id,
+                {
+                    "dir_name": dir_uri.split("/")[-1],
+                    "file_summaries": file_summaries_str,
+                    "children_abstracts": children_abstracts_str,
+                    "output_language": output_language,
+                },
+            )
+        prompt_id = overview_override[0] if overview_override else "semantic.overview_generation"
 
         # Budget guard: check if prompt would be oversized
         estimated_size = len(file_summaries_str) + len(children_abstracts_str)
